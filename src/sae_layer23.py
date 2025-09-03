@@ -85,7 +85,6 @@ class SAE(nn.Module):
 # -------------- Hooked passes --------------
 
 def make_mlp_input_hook(capture: dict):
-    # stores last mlp input under capture["x"] (shape [B,T,d])
     def pre_hook(_module, args):
         capture["x"] = args[0]
         return None
@@ -93,10 +92,6 @@ def make_mlp_input_hook(capture: dict):
 
 def stream_batches(model, tok, layer_idx: int, total_texts: int, collect_bs: int,
                    max_len: int, two_digit: bool, include_equals: bool):
-    """
-    Yields (x_flat [Npos,d], tok_ids_flat [Npos]) per forward.
-    Memory-light: only current batch stays resident.
-    """
     blocks, n_layers, kind = get_block_list(model)
     if layer_idx >= n_layers: raise ValueError(f"layer_idx {layer_idx} >= {n_layers}")
     mlp_mod = get_mlp_module(blocks[layer_idx], kind)
@@ -113,12 +108,12 @@ def stream_batches(model, tok, layer_idx: int, total_texts: int, collect_bs: int
             texts = gen_addition_batch(bs, two_digit, include_equals)
             input_ids, attn_mask = tokenize(tok, texts, max_len)
             input_ids = input_ids.to(dev()); attn_mask = attn_mask.to(dev())
-            _ = model(input_ids=input_ids, attention_mask=attn_mask)  # triggers hook
+            _ = model(input_ids=input_ids, attention_mask=attn_mask)
 
-            x = capture["x"]                       # [B,T,d]
+            x = capture["x"]
             valid = attn_mask.bool()
-            x_flat = x[valid].detach()             # [Npos,d]
-            tok_flat = input_ids[valid].detach()   # [Npos]
+            x_flat = x[valid].detach()
+            tok_flat = input_ids[valid].detach()
             yield x_flat, tok_flat
 
             done += bs; pbar.update(bs)
@@ -132,11 +127,6 @@ def train_sae_stream(model, tok, layer_idx: int, d_code: int,
                      two_digit: bool, include_equals: bool,
                      opt_lr: float, l1_weight: float, epochs: int,
                      microbatch: int):
-    """
-    Trains SAE without storing activations. For each streamed batch, we split
-    x_flat into microbatches and do optimizer steps.
-    """
-    # Prime one batch to infer d_in
     first_stream = stream_batches(model, tok, layer_idx, total_texts=collect_bs,
                                   collect_bs=collect_bs, max_len=max_len,
                                   two_digit=two_digit, include_equals=include_equals)
@@ -147,12 +137,9 @@ def train_sae_stream(model, tok, layer_idx: int, d_code: int,
     opt = torch.optim.AdamW(sae.parameters(), lr=opt_lr)
 
     def step_on_chunk(xb):
-        # ensure correct device/dtype and grads enabled for SAE
-        xb = xb.to(dev())
-        xb = xb.to(dtype=sae.encoder.weight.dtype)
+        xb = xb.to(dev()).to(dtype=sae.encoder.weight.dtype)
         for p in sae.parameters():
             p.requires_grad_(True)
-        # IMPORTANT: override any surrounding no_grad from the streaming generator
         with torch.enable_grad():
             xhat, z = sae(xb)
             mse = ((xhat - xb) ** 2).mean()
@@ -167,12 +154,10 @@ def train_sae_stream(model, tok, layer_idx: int, d_code: int,
     for ep in range(1, epochs+1):
         print(f"\nEpoch {ep}/{epochs}")
         seen = 0; running = 0.0
-        # Rebuild the full stream each epoch
         s = stream_batches(model, tok, layer_idx, total_texts=total_texts,
                            collect_bs=collect_bs, max_len=max_len,
                            two_digit=two_digit, include_equals=include_equals)
         for x_flat, _ in s:
-            # microbatch over positions
             for i in range(0, x_flat.size(0), microbatch):
                 xb = x_flat[i:i+microbatch]
                 loss, mse, l1 = step_on_chunk(xb)
@@ -188,13 +173,8 @@ def analyze_plus_stream(model, tok, sae: SAE, layer_idx: int,
                         total_texts: int, collect_bs: int, max_len: int,
                         two_digit: bool, include_equals: bool, batch_positions: int = 65536,
                         topk_features: int = 25) -> Dict:
-    """
-    Second streamed pass: encodes positions to Z and accumulates mean-all and mean-plus.
-    Uses online sums to avoid storing Z.
-    """
     sae = sae.to(dev()).eval()
 
-    # Find "+" token id robustly
     plus_id = tok.convert_tokens_to_ids("+")
     if plus_id is None or plus_id == tok.unk_token_id:
         plus_id = tok.encode("+", add_special_tokens=False)[0]
@@ -205,13 +185,11 @@ def analyze_plus_stream(model, tok, sae: SAE, layer_idx: int,
     count_all = 0
     count_plus = 0
 
-    # stream again
     s = stream_batches(model, tok, layer_idx, total_texts, collect_bs, max_len, two_digit, include_equals)
     for x_flat, tok_flat in s:
-        # micro-step encode in chunks of positions (CPU->GPU friendly)
         for i in range(0, x_flat.size(0), batch_positions):
             xb = x_flat[i:i+batch_positions].to(dev())
-            _, z = sae(xb)      # [n,d_code]
+            _, z = sae(xb)
             z = z.detach().cpu()
             tb = tok_flat[i:i+batch_positions].cpu()
             sum_all += z.sum(0)
@@ -235,17 +213,24 @@ def analyze_plus_stream(model, tok, sae: SAE, layer_idx: int,
     }
     return report
 
+# -------------- decode_features (top 20 tokens) --------------
+
 @torch.no_grad()
 def decode_features(model, tok, sae: SAE, feature_indices: List[int], topk_tokens: int = 20) -> Dict:
-    E = model.get_input_embeddings().weight.detach().to(dev())   # [V,d]
-    Wd = sae.decoder.weight.detach().to(dev())                    # [d_code,d]
-    E = nn.functional.normalize(E, dim=1); Wd = nn.functional.normalize(Wd, dim=1)
-    out = {}
+    device = next(sae.parameters()).device
+    E = model.get_input_embeddings().weight.detach().to(device)   # [V, d_in]
+    E = nn.functional.normalize(E, dim=1)
+    W = sae.decoder.weight.detach().to(device)                    # [d_in, d_code]
+
+    out: Dict[int, List[Dict]] = {}
     for f in feature_indices:
-        sims = E @ Wd[f].unsqueeze(1)   # [V,1]
-        vals, idxs = torch.topk(sims.squeeze(1), topk_tokens)
+        f = int(f)
+        feat_dir = W[:, f]
+        feat_dir = nn.functional.normalize(feat_dir, dim=0)
+        sims = E @ feat_dir                                       # [V]
+        vals, idxs = torch.topk(sims, k=topk_tokens)
         toks = tok.convert_ids_to_tokens(idxs.tolist())
-        out[int(f)] = [{"token": t, "sim": float(v)} for t, v in zip(toks, vals.tolist())]
+        out[f] = [{"token": t, "sim": float(v)} for t, v in zip(toks, vals.tolist())]
     return out
 
 # -------------- Main --------------
@@ -254,8 +239,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model_name", default="Qwen/Qwen2.5-Math-1.5B-Instruct")
     ap.add_argument("--layer", type=int, default=23)
-    ap.add_argument("--total_texts", type=int, default=40000, help="Number of synthetic prompts per epoch/pass")
-    ap.add_argument("--collect_bs", type=int, default=32, help="How many prompts per forward()")
+    ap.add_argument("--total_texts", type=int, default=40000)
+    ap.add_argument("--collect_bs", type=int, default=32)
     ap.add_argument("--max_len", type=int, default=32)
     ap.add_argument("--two_digit", action="store_true")
     ap.add_argument("--include_equals", action="store_true")
@@ -264,10 +249,10 @@ def main():
     ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--l1", type=float, default=1e-3)
-    ap.add_argument("--microbatch", type=int, default=8192, help="Positions per SAE step")
+    ap.add_argument("--microbatch", type=int, default=8192)
     # Analysis
     ap.add_argument("--topk_features", type=int, default=25)
-    ap.add_argument("--topk_tokens", type=int, default=20)
+    ap.add_argument("--topk_tokens", type=int, default=20)   # default: top 20 tokens
     ap.add_argument("--analysis_chunk", type=int, default=65536)
     # IO
     ap.add_argument("--out_dir", default="sae_out_stream")
@@ -287,7 +272,6 @@ def main():
         device_map=None
     ).to(dev()).eval()
 
-    # -------- Train SAE (streamed) --------
     sae = train_sae_stream(
         model, tok, layer_idx=args.layer, d_code=args.d_code,
         total_texts=args.total_texts, collect_bs=args.collect_bs, max_len=args.max_len,
@@ -295,12 +279,10 @@ def main():
         opt_lr=args.lr, l1_weight=args.l1, epochs=args.epochs, microbatch=args.microbatch
     )
 
-    # Save SAE only (compact)
     torch.save(sae.state_dict(), os.path.join(args.out_dir, "sae.pt"))
     with open(os.path.join(args.out_dir, "sae_meta.json"), "w") as f:
         json.dump({"d_code": args.d_code, "layer": args.layer}, f, indent=2)
 
-    # -------- Analyze "+" (streamed) --------
     plus_report = analyze_plus_stream(
         model, tok, sae, layer_idx=args.layer,
         total_texts=args.total_texts, collect_bs=args.collect_bs, max_len=args.max_len,
@@ -310,13 +292,11 @@ def main():
     with open(os.path.join(args.out_dir, "layer23_plus_report.json"), "w") as f:
         json.dump(plus_report, f, indent=2)
 
-    # Optional: token decodes for top + features
     if plus_report.get("top_feature_indices"):
         dec = decode_features(model, tok, sae, plus_report["top_feature_indices"], args.topk_tokens)
         with open(os.path.join(args.out_dir, "layer23_plus_feature_decodes.json"), "w") as f:
             json.dump(dec, f, indent=2)
 
-    # -------- Minimal console summary --------
     print("\nSummary")
     print(f"- SAE saved to: {os.path.join(args.out_dir,'sae.pt')}")
     print(f"- '+' positions seen: {plus_report.get('plus_positions', 0)} / {plus_report.get('positions_seen', 0)}")
