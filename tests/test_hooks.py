@@ -1,4 +1,4 @@
-from src.hooks import capture_activation_cache
+from src.hooks import get_activation_cache
 from src.load_and_tokenize import load_qwen_instruct_4bit
 
 def test_activation_cache():
