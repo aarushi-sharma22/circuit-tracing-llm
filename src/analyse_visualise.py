@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 from typing import Dict, List
 from transformers import PreTrainedModel
-from patching import run_with_patched_activation
+from src.patching import run_with_patched_activation
 from load_and_tokenize import yes_no_token_ids
 
 
