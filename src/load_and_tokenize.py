@@ -9,84 +9,89 @@ def load_qwen_instruct_4bit(
     torch_dtype=torch.bfloat16,
 ):
     """
-    Load Qwen2.5-7B-Instruct (or any Hugging Face CausalLM) in 4-bit using bitsandbytes.
-    If bitsandbytes/triton is unavailable (e.g., Colab mismatch), falls back to normal fp16/bf16.
+    Load a CausalLM (e.g., Qwen/Qwen2.5-7B-Instruct).
+    Tries 4-bit (bitsandbytes) and falls back to fp16/bf16 if bnb is unavailable.
     """
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
 
+    quantization_config = None
+    use_4bit = True
     try:
-        bnb_config = BitsAndBytesConfig(
+        quantization_config = BitsAndBytesConfig(
             load_in_4bit=True,
-            bnb_4bit_use_double_quant=True,
             bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch_dtype,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
         )
-        model = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            device_map=device_map,
-            quantization_config=bnb_config,
-            torch_dtype=torch_dtype,
-            trust_remote_code=True,
-        )
-        print("[INFO] Loaded with bitsandbytes 4-bit quantization.")
-        return model, tokenizer
     except Exception as e:
-        print(f"[WARN] bitsandbytes 4-bit load failed → {e}")
-        print("[INFO] Falling back to standard model (fp16/bf16).")
+        print("[WARN] bitsandbytes not available or misconfigured; will fall back to standard weights.")
+        use_4bit = False
+
+    try:
         model = AutoModelForCausalLM.from_pretrained(
             model_id,
             device_map=device_map,
-            torch_dtype=torch_dtype,
             trust_remote_code=True,
+            torch_dtype=torch_dtype,
+            quantization_config=quantization_config if use_4bit else None,
         )
-        return model, tokenizer
+    except Exception as e:
+        print("[INFO] Falling back to standard model (fp16/bf16). Error:", str(e))
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            device_map=device_map,
+            trust_remote_code=True,
+            torch_dtype=torch_dtype,
+        )
+
+    return model, tokenizer
 
 
-def apply_qwen_chat_template(tokenizer, questions: List[str]) -> List[str]:
+def apply_qwen_chat_template(tokenizer, questions: List[str], add_generation_prompt: bool = True) -> List[str]:
     """
-    Apply Qwen-style chat template to a list of user questions.
-    Returns a list of rendered strings.
+    Render each plain question into a single-turn chat string using the model's chat template.
     """
-    rendered = []
+    rendered: List[str] = []
     for q in questions:
         messages = [{"role": "user", "content": q}]
-        text = tokenizer.apply_chat_template(
+        s = tokenizer.apply_chat_template(
             messages,
+            add_generation_prompt=add_generation_prompt,
             tokenize=False,
-            add_generation_prompt=True,
+            truncation=False,
         )
-        rendered.append(text)
+        rendered.append(s)
     return rendered
 
 
-def batch_tokenize(
-    tokenizer, rendered_prompts: List[str], max_length: int = 256
-) -> Dict[str, torch.Tensor]:
+def batch_tokenize(tokenizer, prompts: List[str], max_length: int = 4096) -> Dict[str, torch.Tensor]:
     """
-    Tokenize multiple rendered prompts into a batch.
+    Tokenize a list of already-rendered prompts.
     """
-    enc = tokenizer(
-        rendered_prompts,
+    batch = tokenizer(
+        prompts,
         return_tensors="pt",
         padding=True,
         truncation=True,
         max_length=max_length,
+        add_special_tokens=False,
     )
-    return enc
+    return batch
 
 
 def yes_no_token_ids(tokenizer) -> Tuple[int, int]:
     """
     Get token ids for 'Yes' and 'No' (single-token best effort).
     """
-    cands = ["Yes", " Yes", "No", " No"]
-    ids = {c: tokenizer.encode(c, add_special_tokens=False) for c in cands}
+    candidates = ["Yes", " Yes", "No", " No"]
+    ids = {c: tokenizer.encode(c, add_special_tokens=False) for c in candidates}
 
     def pick(base: str) -> int:
         for variant in [base, " " + base]:
             pieces = ids[variant]
             if len(pieces) == 1:
                 return pieces[0]
+        # Fall back to the first piece of the shortest tokenization
         v = min([base, " " + base], key=lambda x: len(ids[x]))
         return ids[v][0]
 
