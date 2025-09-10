@@ -10,25 +10,36 @@ def load_qwen_instruct_4bit(
 ):
     """
     Load Qwen2.5-7B-Instruct (or any Hugging Face CausalLM) in 4-bit using bitsandbytes.
-    Works in Google Colab (Linux + GPU).
+    If bitsandbytes/triton is unavailable (e.g., Colab mismatch), falls back to normal fp16/bf16.
     """
-
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch_dtype,
-    )
-
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        device_map=device_map,
-        quantization_config=bnb_config,
-        torch_dtype=torch_dtype,
-        trust_remote_code=True,
-    )
-    return model, tokenizer
+
+    try:
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch_dtype,
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            device_map=device_map,
+            quantization_config=bnb_config,
+            torch_dtype=torch_dtype,
+            trust_remote_code=True,
+        )
+        print("[INFO] Loaded with bitsandbytes 4-bit quantization.")
+        return model, tokenizer
+    except Exception as e:
+        print(f"[WARN] bitsandbytes 4-bit load failed → {e}")
+        print("[INFO] Falling back to standard model (fp16/bf16).")
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            device_map=device_map,
+            torch_dtype=torch_dtype,
+            trust_remote_code=True,
+        )
+        return model, tokenizer
 
 
 def apply_qwen_chat_template(tokenizer, questions: List[str]) -> List[str]:
