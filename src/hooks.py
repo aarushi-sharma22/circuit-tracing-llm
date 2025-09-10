@@ -1,4 +1,4 @@
-# hooks.py — derive resid_pre offline; keep resid_post/resid_out and mlp_out
+# hooks.py — capture embed_out, resid_post/out, mlp_out; derive resid_pre offline
 
 import torch
 from typing import Dict, List
@@ -15,16 +15,12 @@ def _get_blocks(model: PreTrainedModel):
             return cur
     try:
         h = model.transformer.h
-        if isinstance(h, (list, torch.nn.ModuleList)) and len(h) > 0:
-            return h
-    except AttributeError:
-        pass
+        if isinstance(h, (list, torch.nn.ModuleList)) and len(h) > 0: return h
+    except AttributeError: pass
     try:
         layers = model.gpt_neox.layers
-        if isinstance(layers, (list, torch.nn.ModuleList)) and len(layers) > 0:
-            return layers
-    except AttributeError:
-        pass
+        if isinstance(layers, (list, torch.nn.ModuleList)) and len(layers) > 0: return layers
+    except AttributeError: pass
     raise RuntimeError("Could not locate transformer blocks on this model.")
 
 
@@ -45,14 +41,13 @@ def _find_mlp_out_module(block) -> torch.nn.Module:
                     return getattr(mlp, name)
             last_linear = None
             for _, mod in mlp.named_modules():
-                if isinstance(mod, torch.nn.Linear):
-                    last_linear = mod
+                if isinstance(mod, torch.nn.Linear): last_linear = mod
             return last_linear if last_linear is not None else mlp
     return None
 
 
 def _find_embed_module(model: PreTrainedModel):
-    # Common names across LLaMA/Qwen/GPT2/NeoX families
+    # Common names across Qwen/LLaMA/GPT2/NeoX families
     for path in [
         "model.embed_tokens",
         "model.model.embed_tokens",
@@ -83,9 +78,10 @@ def get_activation_cache(
     """
     Cache:
       - embed_out
-      - resid_post.{i} (and alias resid_out.{i})
+      - resid_post.{i} (alias resid_out.{i})
       - mlp_out.{i}
-      - resid_pre.{0} = embed_out; resid_pre.{i} = resid_post.{i-1} for i>=1
+      - resid_pre.{0} = embed_out
+      - resid_pre.{i} = resid_post.{i-1} for i>=1
     """
     cache: Dict[str, torch.Tensor] = {}
     handles: List[torch.utils.hooks.RemovableHandle] = []
@@ -99,17 +95,17 @@ def get_activation_cache(
             cache["embed_out"] = _to_cpu_f16(_ensure_tensor(out))
         handles.append(embed.register_forward_hook(embed_hook))
 
-    # --- per-block hooks ---
+    # --- per-block outputs + MLP ---
     for i, block in enumerate(blocks):
-        # resid_post/out
+        # residual after the block
         def resid_post_hook(module, inp, out, i=i):
             x = _ensure_tensor(out)
             x_cpu = _to_cpu_f16(x)
             cache[f"resid_post.{i}"] = x_cpu
-            cache[f"resid_out.{i}"]  = x_cpu
+            cache[f"resid_out.{i}"]  = x_cpu  # alias for compat
         handles.append(block.register_forward_hook(resid_post_hook))
 
-        # mlp_out at final projection
+        # mlp_out at final projection (or last Linear fallback)
         mlp_target = _find_mlp_out_module(block)
         if mlp_target is not None:
             def mlp_hook(module, inp, out, i=i):
@@ -128,12 +124,13 @@ def get_activation_cache(
     if "embed_out" in cache:
         cache["resid_pre.0"] = cache["embed_out"]
     else:
-        # worst-case: use first post as a stand-in (still usable for layer>=1)
+        # fallback if embed_out missing; you'll still have resid_pre.{i>=1}
         pass
+
     for i in range(1, n_layers):
-        key_prev = f"resid_post.{i-1}"
-        if key_prev in cache:
-            cache[f"resid_pre.{i}"] = cache[key_prev]
+        prev_post = f"resid_post.{i-1}"
+        if prev_post in cache and f"resid_pre.{i}" not in cache:
+            cache[f"resid_pre.{i}"] = cache[prev_post]
 
     total_bytes = sum(v.numel() for v in cache.values()) * 2
     n_pre  = sum(1 for k in cache if k.startswith("resid_pre."))
