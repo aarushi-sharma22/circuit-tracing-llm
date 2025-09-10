@@ -1,4 +1,4 @@
-from src.patching import patch_hidden_states
+from src.patching import run_with_patched_activation
 from src.load_and_tokenize import load_qwen_instruct_4bit
 
 def test_patching_runs():
