@@ -23,7 +23,7 @@ def load_qwen_instruct_4bit(
             bnb_4bit_use_double_quant=True,
             bnb_4bit_compute_dtype=torch.bfloat16,
         )
-    except Exception as e:
+    except Exception:
         print("[WARN] bitsandbytes not available or misconfigured; will fall back to standard weights.")
         use_4bit = False
 
