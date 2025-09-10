@@ -5,7 +5,7 @@ from patching import run_with_patched_activation
 def test_patching_runs():
     model_id = "sshleifer/tiny-gpt2"
     # Force GPTQ to skip bitsandbytes
-    model, tokenizer = load_qwen_instruct_4bit(model_id, use_gptq=True)
+    model, tokenizer = load_qwen_instruct_4bit(model_id, use_gptq=False)
 
     questions = ["Is stealing wrong?", "Is kindness good?"]
 

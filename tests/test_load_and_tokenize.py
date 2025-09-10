@@ -8,7 +8,7 @@ from load_and_tokenize import (
 def test_tokenize_and_render():
     model_id = "sshleifer/tiny-gpt2"  # tiny model for quick tests
     # Force GPTQ=True to skip bitsandbytes
-    model, tokenizer = load_qwen_instruct_4bit(model_id, use_gptq=True)
+    model, tokenizer = load_qwen_instruct_4bit(model_id, use_gptq=False)
 
     questions = ["Is stealing wrong?", "Is kindness good?"]
 
