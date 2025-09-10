@@ -4,7 +4,6 @@ from transformers import PreTrainedModel
 
 
 def _get_blocks(model: PreTrainedModel):
-    # Must mirror hooks._get_blocks so indices align
     for path in ["model.layers", "model.model.layers", "model.transformer.layers"]:
         cur = model
         ok = True
@@ -31,6 +30,38 @@ def _get_blocks(model: PreTrainedModel):
     raise RuntimeError("Could not locate transformer blocks on this model.")
 
 
+def _ensure_tensor(out):
+    return out[0] if isinstance(out, tuple) else out
+
+
+def _repack_like(original_out, new_tensor):
+    if isinstance(original_out, tuple):
+        as_list = list(original_out)
+        as_list[0] = new_tensor
+        return tuple(as_list)
+    return new_tensor
+
+
+def _find_mlp_out_module(block) -> torch.nn.Module:
+    """
+    Must mirror hooks._find_mlp_out_module so indices align.
+    """
+    for attr in ["mlp", "ffn", "feed_forward"]:
+        if hasattr(block, attr):
+            mlp = getattr(block, attr)
+            for name in ["down_proj", "proj_out", "o_proj", "out_proj"]:
+                if hasattr(mlp, name) and isinstance(getattr(mlp, name), torch.nn.Module):
+                    return getattr(mlp, name)
+            last_linear = None
+            for _, mod in mlp.named_modules():
+                if isinstance(mod, torch.nn.Linear):
+                    last_linear = mod
+            if last_linear is not None:
+                return last_linear
+            return mlp
+    return None
+
+
 def run_with_patched_activation(
     model: PreTrainedModel,
     batch: Dict[str, torch.Tensor],
@@ -39,6 +70,7 @@ def run_with_patched_activation(
     layer_idx: int,
     source_idx: int,
     target_idx: int,
+    inputs_on_device: Dict[str, torch.Tensor] = None,  # optional: reuse pre-moved inputs
 ) -> torch.Tensor:
     """
     Replace the activation at (kind, layer_idx) for the target batch item
@@ -46,18 +78,6 @@ def run_with_patched_activation(
     """
     handles: List[torch.utils.hooks.RemovableHandle] = []
 
-    def _ensure_tensor(out):
-        return out[0] if isinstance(out, tuple) else out
-
-    def _repack_like(original_out, new_tensor):
-        if isinstance(original_out, tuple):
-            # Replace the first element; keep any auxiliary outputs
-            as_list = list(original_out)
-            as_list[0] = new_tensor
-            return tuple(as_list)
-        return new_tensor
-
-    # Fetch the cached tensor and remember device/dtype conversion
     cache_key = f"{kind}.{layer_idx}"
     if cache_key not in cache_source:
         raise KeyError(f"Cache missing key '{cache_key}'. Did you call get_activation_cache on the same model/batch?")
@@ -66,32 +86,34 @@ def run_with_patched_activation(
     block = blocks[layer_idx]
 
     src_act = cache_source[cache_key]  # on CPU float16
-    # We'll move this to the hook's device/dtype when applying
 
     def patch_hook(module, inp, out):
         current = _ensure_tensor(out)
-        # Clone to avoid in-place on autograd graph (we're in no_grad anyway, but keep clean)
         patched = current.clone()
-
-        # ensure dtype/device match
         to_insert = src_act.to(device=current.device, dtype=current.dtype)
+
+        if patched.shape != to_insert.shape:
+            raise RuntimeError(
+                f"Shape mismatch at {cache_key}: current {tuple(patched.shape)} vs cache {tuple(to_insert.shape)}"
+            )
 
         # Replace the whole sequence for the target sample with source sample
         patched[target_idx, :, :] = to_insert[source_idx, :, :]
-
         return _repack_like(out, patched)
 
     if kind == "mlp_out":
-        if not hasattr(block, "mlp"):
-            raise ValueError(f"Block {layer_idx} has no .mlp; cannot patch mlp_out.")
-        handles.append(block.mlp.register_forward_hook(patch_hook))
+        mlp_target = _find_mlp_out_module(block)
+        if mlp_target is None:
+            raise ValueError(f"Block {layer_idx} has no MLP-like submodule; cannot patch mlp_out.")
+        handles.append(mlp_target.register_forward_hook(patch_hook))
     elif kind == "resid_out":
         handles.append(block.register_forward_hook(patch_hook))
     else:
         raise ValueError(f"Unsupported layer kind: {kind}")
 
-    with torch.no_grad():
-        outputs = model(**{k: v.to(model.device) for k, v in batch.items()})
+    with torch.inference_mode():
+        io = inputs_on_device if inputs_on_device is not None else {k: v.to(model.device) for k, v in batch.items()}
+        outputs = model(**io)
         logits = outputs.logits
 
     for h in handles:
