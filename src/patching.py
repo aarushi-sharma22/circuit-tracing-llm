@@ -1,4 +1,4 @@
-# patching.py — robust per-layer residual patch (norm pre-hook) + MLP as before
+# patching.py — robust residual/MLP patching with try/finally hook cleanup
 
 import torch
 from typing import Dict, List
@@ -7,7 +7,7 @@ from transformers import PreTrainedModel
 
 def _get_blocks(model: PreTrainedModel):
     """
-    Return the ModuleList/list of transformer blocks for common decoder stacks.
+    Return the list/ModuleList of transformer blocks for common decoder stacks.
     """
     for path in ["model.layers", "model.model.layers", "model.transformer.layers"]:
         cur = model; ok = True
@@ -67,13 +67,12 @@ def _find_mlp_out_module(block) -> torch.nn.Module:
 
 def _find_first_norm(block) -> torch.nn.Module:
     """
-    Find the first per-layer normalization module inside a block.
-    Works for LLaMA/Qwen-style RMSNorm or LayerNorm.
+    Find the first per-layer normalization module inside a block
+    (works for LLaMA/Qwen-style RMSNorm or LayerNorm).
     """
     for name in ["input_layernorm", "ln_1", "pre_attention_layernorm", "norm1"]:
         if hasattr(block, name) and isinstance(getattr(block, name), torch.nn.Module):
             return getattr(block, name)
-
     # Fallback: scan submodules for a norm-like module
     for _, mod in block.named_modules():
         cls = mod.__class__.__name__.lower()
@@ -97,6 +96,8 @@ def run_with_patched_activation(
     - 'resid_out': patch the residual stream *entering* block[layer_idx] by pre-hooking
       its first LayerNorm/RMSNorm (i.e., the canonical block input). Uses cache 'resid_pre.{layer_idx}'
       if present; else falls back to 'resid_out.{layer_idx}' and patches the next block's input.
+
+    Hooks are always removed via try/finally so crashes don’t leave dangling hooks.
     """
     handles: List[torch.utils.hooks.RemovableHandle] = []
     blocks = _get_blocks(model)
@@ -109,30 +110,24 @@ def run_with_patched_activation(
             where = "this_block_pre_norm"
         elif f"resid_out.{layer_idx}" in cache_source:
             cache_key = f"resid_out.{layer_idx}"
-            where = "next_block_pre"  # fallback: use post-activation to feed next block
+            where = "next_block_pre"
         else:
-            raise KeyError(
-                f"Cache missing 'resid_pre.{layer_idx}' and 'resid_out.{layer_idx}'. "
-                "Rebuild cache with updated hooks capturing resid_pre/resid_out."
-            )
+            raise KeyError(f"Cache missing 'resid_pre.{layer_idx}' and 'resid_out.{layer_idx}'. Rebuild cache.")
     else:
         cache_key = f"{kind}.{layer_idx}"
         where = None
 
     if cache_key not in cache_source:
-        raise KeyError(f"Cache missing key '{cache_key}'. Did you build cache on this model/batch?")
+        raise KeyError(f"Cache missing key '{cache_key}'.")
 
     src_act = cache_source[cache_key]  # CPU fp16
 
-    # --- hook bodies ---
     def patch_forward_hook(module, inp, out):
         current = _ensure_tensor(out)
         patched = current.clone()
         to_insert = src_act.to(device=current.device, dtype=current.dtype)
         if patched.shape != to_insert.shape:
-            raise RuntimeError(
-                f"Shape mismatch at {cache_key}: {tuple(patched.shape)} vs {tuple(to_insert.shape)}"
-            )
+            raise RuntimeError(f"Shape mismatch at {cache_key}: {tuple(patched.shape)} vs {tuple(to_insert.shape)}")
         patched[target_idx, :, :] = to_insert[source_idx, :, :]
         return _repack_like(out, patched)
 
@@ -141,48 +136,46 @@ def run_with_patched_activation(
         x = x.clone()
         to_insert = src_act.to(device=x.device, dtype=x.dtype)
         if x.shape != to_insert.shape:
-            raise RuntimeError(
-                f"Shape mismatch at {cache_key} (pre): {tuple(x.shape)} vs {tuple(to_insert.shape)}"
-            )
+            raise RuntimeError(f"Shape mismatch at {cache_key} (pre): {tuple(x.shape)} vs {tuple(to_insert.shape)}")
         x[target_idx, :, :] = to_insert[source_idx, :, :]
         if isinstance(inp, tuple):
-            lst = list(inp)
-            lst[0] = x
-            return tuple(lst)
+            lst = list(inp); lst[0] = x; return tuple(lst)
         return x
 
-    # --- attach hooks ---
-    if kind == "mlp_out":
-        block = blocks[layer_idx]
-        mlp_target = _find_mlp_out_module(block)
-        if mlp_target is None:
-            raise ValueError(f"Block {layer_idx} has no MLP-like submodule; cannot patch mlp_out.")
-        handles.append(mlp_target.register_forward_hook(patch_forward_hook))
-
-    elif kind == "resid_out":
-        if where == "this_block_pre_norm":
+    try:
+        if kind == "mlp_out":
             block = blocks[layer_idx]
-            norm = _find_first_norm(block)
-            if norm is not None:
-                handles.append(norm.register_forward_pre_hook(patch_pre_hook))
+            mlp_target = _find_mlp_out_module(block)
+            if mlp_target is None:
+                raise ValueError(f"Block {layer_idx} has no MLP-like submodule; cannot patch mlp_out.")
+            handles.append(mlp_target.register_forward_hook(patch_forward_hook))
+
+        elif kind == "resid_out":
+            if where == "this_block_pre_norm":
+                block = blocks[layer_idx]
+                norm = _find_first_norm(block)
+                if norm is not None:
+                    handles.append(norm.register_forward_pre_hook(patch_pre_hook))
+                else:
+                    # Fallback: pre-hook the block itself
+                    handles.append(block.register_forward_pre_hook(patch_pre_hook))
             else:
-                # Fallback: pre-hook the block itself
-                handles.append(block.register_forward_pre_hook(patch_pre_hook))
-        else:  # "next_block_pre" fallback
-            if layer_idx < n_layers - 1:
-                handles.append(blocks[layer_idx + 1].register_forward_pre_hook(patch_pre_hook))
-            else:
-                # Last layer fallback: patch its output
-                handles.append(blocks[layer_idx].register_forward_hook(patch_forward_hook))
-    else:
-        raise ValueError(f"Unsupported layer kind: {kind}")
+                # Fallback: use resid_post to patch next block's input
+                if layer_idx < n_layers - 1:
+                    handles.append(blocks[layer_idx + 1].register_forward_pre_hook(patch_pre_hook))
+                else:
+                    # Last layer fallback: patch its output
+                    handles.append(blocks[layer_idx].register_forward_hook(patch_forward_hook))
+        else:
+            raise ValueError(f"Unsupported layer kind: {kind}")
 
-    # --- run forward once with the patch applied ---
-    with torch.inference_mode():
-        io = inputs_on_device if inputs_on_device is not None else {k: v.to(model.device) for k, v in batch.items()}
-        logits = model(**io).logits
-
-    for h in handles:
-        h.remove()
-
-    return logits
+        with torch.inference_mode():
+            io = inputs_on_device if inputs_on_device is not None else {k: v.to(model.device) for k, v in batch.items()}
+            logits = model(**io).logits
+        return logits
+    finally:
+        for h in handles:
+            try:
+                h.remove()
+            except Exception:
+                pass
