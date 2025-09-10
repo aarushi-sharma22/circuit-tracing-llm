@@ -3,7 +3,7 @@ import torch.nn.functional as F
 from typing import Dict, List
 from transformers import PreTrainedModel
 from src.patching import run_with_patched_activation
-from load_and_tokenize import yes_no_token_ids
+from src.load_and_tokenize import yes_no_token_ids
 
 
 def sweep_patch_layers(
